@@ -1,8 +1,3 @@
-"""
-  @Author:jiutian
-  @Time:2026/10/13
-  @Desc:
-"""
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """

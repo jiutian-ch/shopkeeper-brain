@@ -57,7 +57,7 @@ class AIClients(BaseClientManager):
     @classmethod
     def _create_llm_openai(cls, response_format) -> ChatOpenAI:
         try:
-            api_key = cls._require_env("DASHSCOPE_API_KEY")
+            api_key = cls._require_env("aliQwen-api")
             base_url = cls._require_env("OPENAI_API_BASE")
             model_name = cls._require_env("LLM_DEFAULT_MODEL")
 

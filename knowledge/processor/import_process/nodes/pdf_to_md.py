@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 from typing import Tuple
@@ -16,9 +17,13 @@ class PdfToMdNode(BaseNode):
         import_file_path_obj, file_dir_obj = self._validate_state_inputs_path(state)
         #2.执行MinerU
         processed_code = self._execute_mineru(import_file_path_obj, file_dir_obj)
+        if processed_code != 0:
+            raise FileProcessingError(f"MinerU处理失败，错误码：{processed_code}",self.name)
         #3.获取MD路径
         md_path = self._get_md_paths(import_file_path_obj,file_dir_obj)
 
+        if not Path(md_path).exists():
+            raise FileProcessingError(f"MinerU 未产出 md 文件：{md_path}", self.name)
         #4.修改状态并返回
         state["md_path"] = md_path
 
@@ -44,6 +49,11 @@ class PdfToMdNode(BaseNode):
         return import_file_path_obj,file_dir_obj
 
     def _execute_mineru(self, import_file_path_obj, file_dir_obj) ->int:
+        env = os.environ.copy()
+        env["PYTHONPATH"] = r"D:\Code\shopkeeper_brain\mineru_compat" + (
+            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+        )
+
         proc = subprocess.Popen(
             args=["mineru", "-p", import_file_path_obj, "-o",file_dir_obj, "--source", "local", "--backend", "pipeline"],
             stdout=subprocess.PIPE,  # 捕获标准输出
@@ -51,7 +61,8 @@ class PdfToMdNode(BaseNode):
             text=True,
             encoding="utf-8",
             errors="replace",  # 遇到乱码时替换
-            bufsize=1  # 行缓冲，实时输出
+            bufsize=1, # 行缓冲，实时输出
+            env=env
         )
 
         for line in proc.stdout:
@@ -64,7 +75,7 @@ class PdfToMdNode(BaseNode):
     def _get_md_paths(self, import_file_path_obj: Path, file_dir_obj: Path) -> str :
 
         file_name = import_file_path_obj.stem
-        md_path =  import_file_path_obj / file_name / "auto" / f"{file_name}.md"
+        md_path =  file_dir_obj / file_name / "auto" / f"{file_name}.md"
 
         return str(md_path)
 

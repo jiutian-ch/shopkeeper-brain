@@ -12,6 +12,9 @@ from typing import Tuple, List, Dict, Deque, Optional
 import base64
 
 import json
+import urllib.error
+import urllib.parse
+import urllib.request
 
 from minio import Minio
 from openai import OpenAI
@@ -77,7 +80,8 @@ class MdFileHandler:
         """
         self.logger.info("备份新文档")
         # 万用表RS-12的使用.md  ->   万用表RS-12的使用_new.md
-        backup_path = md_path_obj.with_name(md_path_obj.name + "_new.md")
+        # 注意：不能用 name + "_new.md"（会得到 xxx.md_new.md），要用 stem 换掉原扩展名
+        backup_path = md_path_obj.with_name(md_path_obj.stem+"_new.md")
         with open(backup_path, 'w', encoding='utf-8') as f:
             f.write(new_md_content)
 
@@ -438,23 +442,57 @@ class ImageUploader:
         try:
             minio_client: Minio = StorageClients.get_minio_client()
         except Exception as e:
-            # 连接不上客户端降级处理
+            # 连接不上客户端降级处理：写成字符串，否则后面 f-string 拼出来是 Windows 反斜杠路径
+            self.logger.error(f"获取MinIO客户端失败，图片保留本地路径：{e}")
             for image_info in imageinfo_list:
-                remote_urls[image_info.name] = image_info.path
+                remote_urls[image_info.name] = str(image_info.path)
             return remote_urls
-        # 循环上传照片
+
+        # 对象名（MinIO key）保持中文原文；URL 里必须做百分号编码，否则部分渲染器/网关会 404
+        safe_document_name = urllib.parse.quote(document_name, safe="")
+
         for image_info in imageinfo_list:
+            object_name = f"{document_name}/{image_info.name}"
             try:
                 minio_client.fput_object(bucket_name = minio_bucket,  # 上传到指定的桶
-                                         object_name = f"{document_name}/{image_info.name}", #上传后图片名称（带目录名称）
-                                         file_path = image_info.path) #本地图片
-                remote_url = f"{get_minio_base_url}/{minio_bucket}/{document_name}/{image_info.name}"
-                remote_urls[image_info.name] = remote_url #上传成功，设置为远程地址
+                                         object_name = object_name,  # 上传后图片名称（带目录名称）
+                                         file_path = image_info.path)  # 本地图片
+                remote_url = (
+                    f"{get_minio_base_url}/{minio_bucket}/"
+                    f"{safe_document_name}/{urllib.parse.quote(image_info.name, safe='')}"
+                )
+                remote_urls[image_info.name] = remote_url  # 上传成功，设置为远程地址
             except Exception as e:
                 # 二级降级处理  只针对上传失败某个图片进行降级,设置为本地图片地址
-                remote_urls[image_info.name] = image_info.path
+                self.logger.error(f"图片 {image_info.name} 上传MinIO失败，保留本地路径：{e}")
+                remote_urls[image_info.name] = str(image_info.path)
+
+        # 3.上传成功后探一次公开可读性：桶没配匿名只读策略时，MD里的图片链接在浏览器/前端会全部 403
+        self._warn_if_not_publicly_readable(minio_bucket, remote_urls)
 
         return remote_urls
+
+    def _warn_if_not_publicly_readable(self, minio_bucket: str, remote_urls: Dict[str, str]) -> None:
+        """用匿名请求探一下第一张图，403 说明桶策略缺失（代码没问题，是MinIO权限问题）。"""
+        for url in remote_urls.values():
+            if not url.startswith("http"):
+                continue
+            try:
+                req = urllib.request.Request(url, method="HEAD")
+                with urllib.request.urlopen(req, timeout=5):
+                    return
+            except urllib.error.HTTPError as e:
+                if e.code == 403:
+                    self.logger.warning(
+                        f"桶 {minio_bucket} 匿名访问被拒绝(403)，MD中的图片链接将无法显示！"
+                        f"需要给桶配置公开只读策略：mc anonymous set download local/{minio_bucket}"
+                    )
+                else:
+                    self.logger.warning(f"图片URL匿名访问异常 HTTP {e.code}：{url}")
+                return
+            except Exception as e:
+                self.logger.warning(f"图片URL可访问性探测失败（不影响上传）：{e}")
+                return
 
     def _replace_in_md(self, remote_urls: Dict[str, str], md_content: str, imageinfo_list: List[ImageInfo], summarizes: Dict[str, str])-> str:
         """
@@ -483,17 +521,48 @@ class ImageUploader:
                :return: 新md文档内容
         """
 
-        pattern = re.compile(r"!\[(.*?)\]\((.*?)\)")
+        # Markdown 写法：![alt](path)   HTML 写法：<img src="path">
+        md_pattern = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)]*)\)")
+        html_pattern = re.compile(
+            r"<img\b[^>]*\bsrc\s*=\s*(?P<q>[\"'])(?P<src>[^\"']*)(?P=q)[^>]*>",
+            re.IGNORECASE,
+        )
 
-        def replacer(match):
-            original_url = match.group(2).strip()  # 匹配到的图片本地地址
-            image_url_md = Path(original_url).name  # 图片在md中的文件名称，带扩展名
-            for image_name, summary in summarizes.items():
-                if image_name == image_url_md:
-                    return f"![{summary}]({remote_urls[image_name]})" #匹配内容被替换后结果
-            return match.group(0)   # 正则表达式匹配到的原文
+        def _image_name_from_ref(ref: str) -> str:
+            """从引用地址里取出文件名，兼容 images/xxx.jpg、./images/xxx.jpg、URL 带 query、URL 被编码。"""
+            ref = ref.strip()
+            if ref.startswith(("http://", "https://")):
+                ref = urllib.parse.urlsplit(ref).path
+            ref = urllib.parse.unquote(ref)
+            return ref.replace("\\", "/").rsplit("/", 1)[-1]
 
-        return pattern.sub(replacer, md_content)
+        def _resolve(src: str) -> Optional[Tuple[str, str]]:
+            """返回 (摘要, 远程地址)；未命中返回 None。"""
+            image_name = _image_name_from_ref(src)
+            summary = summarizes.get(image_name)
+            remote_url = remote_urls.get(image_name)
+            if not summary or not remote_url:
+                return None
+            # 摘要里若带 ] 会破坏 Markdown 语法，做一次转义
+            return summary.replace("]", "\\]"), str(remote_url)
+
+        def md_replacer(match: re.Match) -> str:
+            hit = _resolve(match.group("src"))
+            if not hit:
+                return match.group(0)  # 正则表达式匹配到的原文
+            summary, remote_url = hit
+            return f"![{summary}]({remote_url})"
+
+        def html_replacer(match: re.Match) -> str:
+            hit = _resolve(match.group("src"))
+            if not hit:
+                return match.group(0)
+            summary, remote_url = hit
+            alt = summary.replace('"', "&quot;")
+            return f'<img src="{remote_url}" alt="{alt}">'
+
+        new_md_content = md_pattern.sub(md_replacer, md_content)
+        return html_pattern.sub(html_replacer, new_md_content)
 
 
 class MarkDownImageNode(BaseNode):
@@ -549,6 +618,7 @@ class MarkDownImageNode(BaseNode):
         # 5.备份替换后的md文档
         self.md_file_handler.backup(md_path_obj, new_md_content)
 
+        state["md_content"] = new_md_content
         return state
 
 if __name__ == "__main__":

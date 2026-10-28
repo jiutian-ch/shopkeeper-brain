@@ -81,6 +81,9 @@ class DocumentSplitNode(BaseNode):
         # 6.数据备份
         self._backup_chunks(state, final_chunks)
 
+        #状态值设置
+        state["chunks"] = final_chunks
+
         return state
 
     # ==================================================================================
@@ -416,7 +419,7 @@ if __name__ == '__main__':
     setup_logging()
 
     node = DocumentSplitNode()
-    file_path = r"D:\Code\shopkeeper_brain_file\tmp_dir\万用表RS-12的使用\auto\万用表RS-12的使用.md"   #被切分文档
+    file_path = r"D:\Code\shopkeeper_brain_file\tmp_dir\万用表RS-12的使用\auto\万用表RS-12的使用_new.md"   #被切分文档
     with open(file_path, "r", encoding="utf-8") as f:
         content = f.read()
     state = {
